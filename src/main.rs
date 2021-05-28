@@ -1,11 +1,14 @@
 #![feature(iter_advance_by)]
-use bevy::prelude::*;
+use bevy::{
+    input::{keyboard::KeyboardInput, ElementState},
+    prelude::*,
+};
 use bevy_kira_audio::{Audio, AudioChannel, AudioPlugin, AudioSource};
 
 // const ARBITRARY_OSU_TIME_OFFSET: i32 = 60;
 const ARBITRARY_OSU_TIME_OFFSET: i32 = 55;
 
-const HIT_ACCURACY: i32 = 100;
+const HIT_ACCURACY: i64 = 100;
 
 const OSU_FILE: &str = "songs/aotd/DragonForce - Ashes of the Dawn (Nao Tomori) [Futsuu].osu";
 const OGG_FILE: &str = "songs/aotd/audio.ogg";
@@ -23,7 +26,7 @@ macro_rules! some_or_return {
     };
 }
 
-pub struct Block(bool);
+pub struct Block;
 
 pub struct Timed(i32);
 
@@ -38,6 +41,9 @@ pub struct AudioChannels {
 
 #[derive(Default)]
 pub struct SongStartedAt(Option<u128>);
+
+#[derive(Default)]
+pub struct TimeInSong(Option<u128>);
 
 pub struct SongStarted;
 
@@ -156,13 +162,11 @@ fn epic_block_time(
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<ColorMaterial>>,
     mut commands: Commands,
-    time: Res<Time>,
     mut bongo_map: ResMut<BongoMap>,
-    song_started_at: Res<SongStartedAt>,
+    time_in_song: Res<TimeInSong>,
 ) {
-    let song_started_at = some_or_return!(song_started_at.0);
+    let since_start = some_or_return!(time_in_song.0);
 
-    let since_start = time.time_since_startup().as_millis() - song_started_at;
     let mut count = 0;
     let texture_handle = asset_server.load("sprites/smol_square.png");
     let mat_handle = materials.add(texture_handle.into());
@@ -177,7 +181,7 @@ fn epic_block_time(
                 },
                 ..Default::default()
             })
-            .insert(Block(false))
+            .insert(Block)
             .insert(Timed(*time));
     }
     for n in 0..count {
@@ -185,36 +189,31 @@ fn epic_block_time(
     }
 }
 
-fn kill_blocks(
-    mut commands: Commands,
-    time: Res<Time>,
-    song_started_at: Res<SongStartedAt>,
-    query: Query<(Entity, &Timed), With<Block>>,
-) {
-    let song_started_at = some_or_return!(song_started_at.0);
-    let since_start = time.time_since_startup().as_millis() as i64 - song_started_at as i64;
+fn kill_blocks(mut commands: Commands, time_in_song: Res<TimeInSong>, query: Query<(Entity, &Timed), With<Block>>) {
+    let since_start = some_or_return!(time_in_song.0);
     for (entity, timed) in query.iter() {
-        if (timed.0 as i64) - since_start < -1000 {
+        if (timed.0 as i64) - (since_start as i64) < -1000 {
             commands.entity(entity).despawn_recursive();
         }
     }
 }
 
-fn user_hits(
+fn keyboard_events(
+    mut key_evr: EventReader<KeyboardInput>,
+    time_in_song: Res<TimeInSong>,
     asset_server: Res<AssetServer>,
     mut commands: Commands,
     audio_channels: Res<AudioChannels>,
-    time: Res<Time>,
-    song_started_at: Res<SongStartedAt>,
     audio: Res<Audio>,
-    query: Query<(Entity, &Block, &Timed)>,
-    keys: Res<Input<KeyCode>>,
+    query: Query<(Entity, &Timed)>,
 ) {
-    let song_started_at = some_or_return!(song_started_at.0);
-    let since_start = time.time_since_startup().as_millis() as i64 - song_started_at as i64;
-
-    if keys.just_pressed(KeyCode::F) {
-        let closest_hit = query.iter().min_by_key(|(_, _, timed)| i64::abs(timed.0 as i64 - since_start));
+    for _ in key_evr.iter().filter(|x| x.state == ElementState::Pressed) {
+        let since_start = some_or_return!(time_in_song.0);
+        let closest_hit = query
+            .iter()
+            .map(|(entity, timed)| (entity, i64::abs(timed.0 as i64 - (since_start as i64))))
+            .min_by_key(|(_, diff)| *diff)
+            .filter(|(_, diff)| *diff < HIT_ACCURACY);
         if let Some((entity, ..)) = closest_hit {
             commands.entity(entity).despawn_recursive();
             let bong_handle = asset_server.load("sfx/bong.ogg");
@@ -223,12 +222,17 @@ fn user_hits(
     }
 }
 
-fn move_blocks(time: Res<Time>, song_started_at: Res<SongStartedAt>, mut query: Query<(&mut Transform, &Timed), With<Block>>) {
-    let song_started_at = some_or_return!(song_started_at.0);
-    let since_start = time.time_since_startup().as_millis() as i64 - song_started_at as i64;
+fn move_blocks(time_in_song: Res<TimeInSong>, mut query: Query<(&mut Transform, &Timed), With<Block>>) {
+    let since_start = some_or_return!(time_in_song.0);
     for (mut transform, timed) in query.iter_mut() {
         transform.translation.x = timed.0 as f32 - since_start as f32;
     }
+}
+
+fn update_time(time: ResMut<Time>, song_started_at: Res<SongStartedAt>, mut time_in_song: ResMut<TimeInSong>) {
+    let started_at = some_or_return!(song_started_at.0);
+    let since_start = time.time_since_startup().as_millis() - started_at;
+    time_in_song.0 = Some(since_start);
 }
 
 fn main() {
@@ -237,13 +241,15 @@ fn main() {
         .add_plugin(AudioPlugin)
         .init_resource::<BongoMap>()
         .init_resource::<SongStartedAt>()
+        .init_resource::<TimeInSong>()
         .add_startup_system(setup.system())
         .add_startup_system(setup_audio.system())
         .add_startup_system(load_assets.system())
         .add_system(epic_block_time.system())
+        .add_system(update_time.system())
         .add_system(move_blocks.system())
         .add_system(kill_blocks.system())
-        .add_system(user_hits.system())
+        .add_system(keyboard_events.system())
         .add_system(handle_song_loading.system())
         .run();
 }
